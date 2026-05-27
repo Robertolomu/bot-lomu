@@ -1,17 +1,17 @@
 {
-  "name": "bot-lomu-mantenimiento",
+  "name": "bot-lomu",
   "version": "1.0.0",
-  "description": "Bot WhatsApp de mantenimiento vehicular LOMU",
+  "description": "Bot WhatsApp mantenimiento LOMU",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "node-fetch": "^2.7.0"
+    "axios": "^1.6.0",
+    "@anthropic-ai/sdk": "^0.27.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18.0.0"
   }
 }
