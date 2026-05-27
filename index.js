@@ -1,209 +1,254 @@
-const express = require('express');
-const fetch = require('node-fetch');
+/**
+ * Bot LOMU — Mantenimiento Vehicular 🚛
+ * Variables de entorno requeridas:
+ *   ANTHROPIC_API_KEY  — clave Anthropic Claude
+ *   WAHA_URL           — URL base de WAHA
+ *   WAHA_SESSION       — nombre de sesión (default: "default")
+ *   WAHA_API_KEY       — API key de WAHA
+ *   BOT_URL            — URL pública de este servidor
+ *   SHEET_CSV_URL      — URL CSV público de Google Sheets  ← FALTABA ESTO
+ */
 
+'use strict';
+
+const express  = require('express');
+const axios    = require('axios');
+const Anthropic = require('@anthropic-ai/sdk');
+
+const PORT         = process.env.PORT || 3000;
+const WAHA_URL     = (process.env.WAHA_URL  || '').replace(/\/$/, '');
+const SESSION      = process.env.WAHA_SESSION || 'default';
+const WAHA_API_KEY = process.env.WAHA_API_KEY || '';
+const BOT_URL      = (process.env.BOT_URL   || '').replace(/\/$/, '');
+const SHEET_URL    = process.env.SHEET_CSV_URL || '';
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+let records  = [];
+let lastFetch = null;
+
+function wahaHeaders() {
+  return WAHA_API_KEY ? { 'X-Api-Key': WAHA_API_KEY } : {};
+}
+
+// ── Google Sheets CSV ─────────────────────────────────────────────────────────
+async function loadSheet() {
+  if (!SHEET_URL) {
+    console.warn('[SHEET] SHEET_CSV_URL no configurada');
+    return;
+  }
+  try {
+    const res   = await axios.get(SHEET_URL, { timeout: 15000 });
+    const lines = res.data.trim().split('\n');
+    if (lines.length < 2) return;
+    const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+    records = lines.slice(1).map(line => {
+      const cols = line.match(/(".*?"|[^,]+)(?=\s*,|\s*$)/g) || line.split(',');
+      const obj  = {};
+      headers.forEach((h, i) => { obj[h] = (cols[i] || '').trim().replace(/^"|"$/g, ''); });
+      return obj;
+    });
+    lastFetch = new Date().toISOString();
+    console.log(`[SHEET] ${records.length} registros cargados`);
+  } catch (err) {
+    console.error('[SHEET] Error:', err.message);
+  }
+}
+loadSheet();
+setInterval(loadSheet, 10 * 60 * 1000);
+
+// ── Webhook WAHA ──────────────────────────────────────────────────────────────
+async function setupWebhook() {
+  if (!BOT_URL || !WAHA_URL) return;
+  const webhookUrl = `${BOT_URL}/webhook`;
+  try {
+    await axios.put(
+      `${WAHA_URL}/api/sessions/${SESSION}`,
+      { config: { webhooks: [{ url: webhookUrl, events: ['message', 'message.any'] }] } },
+      { headers: { ...wahaHeaders(), 'Content-Type': 'application/json' } }
+    );
+    console.log('[WEBHOOK] Configurado:', webhookUrl);
+  } catch (_) {
+    try {
+      await axios.post(
+        `${WAHA_URL}/api/sessions/${SESSION}/webhooks`,
+        { url: webhookUrl, events: ['message'] },
+        { headers: { ...wahaHeaders(), 'Content-Type': 'application/json' } }
+      );
+      console.log('[WEBHOOK] Configurado (v1):', webhookUrl);
+    } catch (e2) {
+      console.warn('[WEBHOOK] No se pudo configurar:', e2.message);
+    }
+  }
+}
+
+// ── Iniciar sesión WAHA ───────────────────────────────────────────────────────
+async function startSession() {
+  if (!WAHA_URL) return;
+  try {
+    await axios.post(
+      `${WAHA_URL}/api/sessions`,
+      { name: SESSION, config: {} },
+      { headers: { ...wahaHeaders(), 'Content-Type': 'application/json' } }
+    );
+    console.log('[WAHA] Sesión creada:', SESSION);
+  } catch (_) {
+    try {
+      await axios.post(`${WAHA_URL}/api/sessions/${SESSION}/start`, {}, { headers: wahaHeaders() });
+    } catch (e2) {
+      console.log('[WAHA] Sesión ya existe o error ignorado:', e2.message);
+    }
+  }
+  setTimeout(setupWebhook, 5000);
+}
+
+// ── Claude ────────────────────────────────────────────────────────────────────
+async function askClaude(userMessage) {
+  const context = records.length > 0
+    ? `Datos de mantenimiento de flota LOMU (${records.length} registros):\n` +
+      records.map(r => JSON.stringify(r)).join('\n')
+    : 'No hay datos de mantenimiento disponibles en este momento.';
+
+  const msg = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 500,
+    system: `Eres el asistente de mantenimiento vehicular de LOMU (Transportes y Maquinarias).
+Responde consultas sobre el historial de mantenimiento de la flota basándote SOLO en los datos proporcionados.
+Sé claro y conciso. Si no encuentras la información, dilo. Responde en español.\n\n${context}`,
+    messages: [{ role: 'user', content: userMessage }]
+  });
+  return msg.content[0].text;
+}
+
+// ── Enviar mensaje ────────────────────────────────────────────────────────────
+async function sendMessage(chatId, text) {
+  await axios.post(
+    `${WAHA_URL}/api/sendText`,
+    { chatId, text, session: SESSION },
+    { headers: { ...wahaHeaders(), 'Content-Type': 'application/json' } }
+  );
+}
+
+// ── Express ───────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 
-const CONFIG = {
-  ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
-  WAHA_URL:          process.env.WAHA_URL || 'http://localhost:3000',
-  WAHA_SESSION:      process.env.WAHA_SESSION || 'default',
-  WAHA_API_KEY:      process.env.WAHA_API_KEY || 'waha',
-  BOT_URL:           process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : process.env.BOT_URL,
-  CSV_URL:           process.env.CSV_URL || 'https://docs.google.com/spreadsheets/d/e/2PACX-1vThPXYqYxXVdzAwhtqIfACyyOghZ_e4O4YE_m5jaE1Zn5TxiyBUp6Q8WL8FOy-XeKigTHFDFd_ZdYR/pub?gid=2044008320&single=true&output=csv',
-  PORT:              process.env.PORT || 8080,
-};
-
-let sheetCache = { data: [], updatedAt: null };
-
-function wahaHeaders() {
-  return {
-    'Content-Type': 'application/json',
-    'X-Api-Key': CONFIG.WAHA_API_KEY,
-  };
-}
-
-async function fetchSheetData() {
-  const CACHE_TTL = 5 * 60 * 1000;
-  if (sheetCache.data.length && sheetCache.updatedAt && (Date.now() - sheetCache.updatedAt < CACHE_TTL)) {
-    return sheetCache.data;
-  }
+app.get('/', async (req, res) => {
+  let sessionStatus = 'unknown';
   try {
-    const res  = await fetch(CONFIG.CSV_URL);
-    const text = await res.text();
-    const rows = parseCSV(text);
-    sheetCache = { data: rows, updatedAt: Date.now() };
-    console.log(`[Sheet] ${rows.length} registros cargados`);
-    return rows;
-  } catch (e) {
-    console.error('[Sheet] Error:', e.message);
-    return sheetCache.data;
-  }
-}
+    const s = await axios.get(`${WAHA_URL}/api/sessions/${SESSION}`, { headers: wahaHeaders(), timeout: 5000 });
+    sessionStatus = s.data.status || 'unknown';
+  } catch (_) {}
+  res.json({ status: 'ok', bot: 'LOMU Mantenimiento Bot', records: records.length, lastFetch, sessionStatus, qr: `${BOT_URL}/qr`, statusUrl: `${BOT_URL}/status` });
+});
 
-function parseCSV(text) {
-  const lines = text.trim().split('\n');
-  if (lines.length < 2) return [];
-  const headers = lines[0].split(',').map(h => h.replace(/"/g, '').trim());
-  return lines.slice(1).filter(l => l.trim()).map(line => {
-    const vals = [];
-    let cur = '', inQuote = false;
-    for (const ch of line) {
-      if (ch === '"') { inQuote = !inQuote; }
-      else if (ch === ',' && !inQuote) { vals.push(cur.trim()); cur = ''; }
-      else cur += ch;
-    }
-    vals.push(cur.trim());
-    const obj = {};
-    headers.forEach((h, i) => { obj[h] = (vals[i] || '').replace(/"/g, '').trim(); });
-    return obj;
-  }).filter(r => r['Placa']);
-}
-
-async function askClaude(question, sheetData) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': CONFIG.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1000,
-      system: `Eres el asistente de mantenimiento vehicular de LOMU (Transportes y Maquinarias).
-Respondes consultas por WhatsApp sobre el historial de mantenimiento de la flota.
-Usa ÚNICAMENTE los datos del Google Sheet. Responde en español, claro y directo. Sin markdown. Solo texto plano.
-Fecha actual: ${new Date().toLocaleDateString('es-PE')}.
-DATOS DEL SHEET:\n${JSON.stringify(sheetData, null, 2)}`,
-      messages: [{ role: 'user', content: question }],
-    }),
-  });
-  const data = await res.json();
-  if (data.error) throw new Error(data.error.message);
-  return data.content?.[0]?.text || 'No pude procesar la consulta.';
-}
-
-async function sendWhatsApp(chatId, message) {
-  try {
-    const res = await fetch(`${CONFIG.WAHA_URL}/api/sendText`, {
-      method: 'POST',
-      headers: wahaHeaders(),
-      body: JSON.stringify({ session: CONFIG.WAHA_SESSION, chatId, text: message }),
-    });
-    return res.json();
-  } catch (e) {
-    console.error('[WA Send] Error:', e.message);
-  }
-}
-
-async function setupWAHA() {
-  await new Promise(r => setTimeout(r, 5000));
-  console.log('[WAHA] Iniciando sesión...');
-  try {
-    // Iniciar sesión
-    await fetch(`${CONFIG.WAHA_URL}/api/sessions/start`, {
-      method: 'POST',
-      headers: wahaHeaders(),
-      body: JSON.stringify({ name: CONFIG.WAHA_SESSION }),
-    });
-    console.log('[WAHA] Sesión iniciada');
-
-    // Configurar webhook
-    if (CONFIG.BOT_URL) {
-      await fetch(`${CONFIG.WAHA_URL}/api/sessions/${CONFIG.WAHA_SESSION}/config/update`, {
-        method: 'PUT',
-        headers: wahaHeaders(),
-        body: JSON.stringify({
-          webhooks: [{ url: `${CONFIG.BOT_URL}/webhook`, events: ['message'] }]
-        }),
-      });
-      console.log(`[WAHA] Webhook configurado: ${CONFIG.BOT_URL}/webhook`);
-    }
-
-    // Obtener QR
-    setTimeout(async () => {
-      try {
-        const qrRes = await fetch(`${CONFIG.WAHA_URL}/api/${CONFIG.WAHA_SESSION}/auth/qr`, {
-          headers: wahaHeaders()
-        });
-        if (qrRes.ok) {
-          console.log('[WAHA] QR disponible en: GET /qr');
-        }
-      } catch(e) {}
-    }, 3000);
-
-  } catch (e) {
-    console.error('[WAHA Setup] Error:', e.message);
-  }
-}
-
-// Endpoint para ver el QR en el navegador
+// QR para escanear
 app.get('/qr', async (req, res) => {
   try {
-    const qrRes = await fetch(`${CONFIG.WAHA_URL}/api/${CONFIG.WAHA_SESSION}/auth/qr?format=image`, {
-      headers: wahaHeaders()
-    });
-    if (qrRes.ok) {
-      const buf = await qrRes.buffer();
-      res.setHeader('Content-Type', 'image/png');
-      res.send(buf);
-    } else {
-      res.json({ error: 'QR no disponible aún, espera 10 segundos y recarga' });
+    const r = await axios.get(
+      `${WAHA_URL}/api/${SESSION}/auth/qr`,
+      { headers: { ...wahaHeaders(), Accept: 'image/png' }, responseType: 'arraybuffer', timeout: 10000 }
+    );
+    res.set('Content-Type', 'image/png');
+    return res.send(r.data);
+  } catch (_) {}
+
+  try {
+    const r = await axios.get(
+      `${WAHA_URL}/api/sessions/${SESSION}/auth/qr`,
+      { headers: wahaHeaders(), timeout: 10000 }
+    );
+    if (r.data && r.data.value) {
+      return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>QR LOMU</title>
+<style>body{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;font-family:sans-serif;background:#f5f5f5;}
+img{border:8px solid white;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.15);}</style></head>
+<body><h2>📱 Escanea con WhatsApp</h2>
+<img src="data:image/png;base64,${r.data.value}" width="300" height="300"/>
+<p style="color:#666">⏱ Expira en ~60s — recarga si falla</p>
+<p><a href="/restart">🔄 Reiniciar sesión</a></p></body></html>`);
     }
-  } catch (e) {
-    res.json({ error: e.message });
-  }
+  } catch (_) {}
+
+  res.status(503).send(`<html><body style="font-family:sans-serif;text-align:center;padding:40px">
+<h2>⚠️ QR no disponible</h2>
+<p>La sesión puede estar ya conectada, o WAHA está iniciando.</p>
+<p><a href="/restart">🔄 Reiniciar sesión y obtener QR fresco</a></p>
+<p><a href="${WAHA_URL}/dashboard" target="_blank">Dashboard WAHA</a></p>
+</body></html>`);
 });
 
-// Estado de la sesión
+// Estado sesión
 app.get('/status', async (req, res) => {
   try {
-    const r = await fetch(`${CONFIG.WAHA_URL}/api/sessions/${CONFIG.WAHA_SESSION}`, {
-      headers: wahaHeaders()
-    });
-    const data = await r.json();
-    res.json(data);
-  } catch (e) {
-    res.json({ error: e.message });
+    const r = await axios.get(`${WAHA_URL}/api/sessions/${SESSION}`, { headers: wahaHeaders(), timeout: 8000 });
+    res.json(r.data);
+  } catch (err) {
+    res.status(502).json({ error: 'No se pudo contactar WAHA', detail: err.message });
   }
 });
 
-// Webhook — recibe mensajes de WAHA
+// Reiniciar sesión WAHA — FIX para "Can't link new devices"
+app.get('/restart', async (req, res) => {
+  console.log('[RESTART] Reiniciando sesión WAHA...');
+  try {
+    try { await axios.post(`${WAHA_URL}/api/sessions/${SESSION}/stop`, {}, { headers: wahaHeaders() }); } catch (_) {}
+    try { await axios.delete(`${WAHA_URL}/api/sessions/${SESSION}`, { headers: wahaHeaders() }); } catch (_) {}
+    await new Promise(r => setTimeout(r, 2000));
+    await axios.post(
+      `${WAHA_URL}/api/sessions`,
+      { name: SESSION, config: {} },
+      { headers: { ...wahaHeaders(), 'Content-Type': 'application/json' } }
+    );
+    await new Promise(r => setTimeout(r, 3000));
+    await setupWebhook();
+    res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:40px">
+<h2>✅ Sesión reiniciada</h2><p>Redirigiendo al QR en 5 segundos...</p>
+<p><a href="/qr">📱 Ir al QR ahora</a></p>
+<script>setTimeout(()=>window.location='/qr',5000);</script>
+</body></html>`);
+  } catch (err) {
+    res.status(500).json({ error: 'Error al reiniciar', detail: err.message });
+  }
+});
+
+// Webhook: mensajes entrantes de WAHA
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
-  const event = req.body;
-  if (event.event !== 'message' || !event.payload) return;
-  const msg = event.payload;
-  if (msg.fromMe) return;
-  if (msg.type !== 'chat') return;
-  const chatId = msg.from;
-  const text = (msg.body || '').trim();
-  if (!text) return;
-  console.log(`[WA] ${chatId}: ${text}`);
   try {
-    const sheetData = await fetchSheetData();
-    const reply = await askClaude(text, sheetData);
-    await sendWhatsApp(chatId, reply);
-  } catch (e) {
-    console.error('[Bot]', e.message);
-    await sendWhatsApp(chatId, 'Error al consultar. Intenta de nuevo.');
+    const events = Array.isArray(req.body) ? req.body : [req.body];
+    for (const event of events) {
+      if (event.event !== 'message' && event.event !== 'message.any') continue;
+      const msg = event.payload || event;
+      if (!msg || !msg.body || msg.fromMe) continue;
+      const text   = msg.body.trim();
+      const chatId = msg.from || msg.chatId;
+      if (!text || !chatId) continue;
+      console.log(`[MSG] De ${chatId}: ${text}`);
+      try {
+        const respuesta = await askClaude(text);
+        await sendMessage(chatId, respuesta);
+      } catch (err) {
+        console.error('[CLAUDE/SEND] Error:', err.message);
+        try { await sendMessage(chatId, '⚠️ Error procesando tu consulta. Intenta de nuevo.'); } catch (_) {}
+      }
+    }
+  } catch (err) {
+    console.error('[WEBHOOK] Error:', err.message);
   }
 });
 
-app.get('/', (req, res) => {
-  res.json({
-    status: 'ok',
-    bot: 'LOMU Mantenimiento Bot',
-    records: sheetCache.data.length,
-    qr: `${CONFIG.BOT_URL || ''}/qr`,
-    sessionStatus: `${CONFIG.BOT_URL || ''}/status`,
-  });
+// Recargar datos manualmente
+app.get('/reload', async (req, res) => {
+  await loadSheet();
+  res.json({ status: 'ok', records: records.length, lastFetch });
 });
 
-fetchSheetData();
-
-app.listen(CONFIG.PORT, () => {
-  console.log(`Bot LOMU corriendo en puerto ${CONFIG.PORT}`);
-  setupWAHA();
+app.listen(PORT, async () => {
+  console.log(`\n🚛 Bot LOMU en puerto ${PORT}`);
+  console.log(`   WAHA_URL:    ${WAHA_URL}`);
+  console.log(`   SESSION:     ${SESSION}`);
+  console.log(`   BOT_URL:     ${BOT_URL}`);
+  console.log(`   SHEET_URL:   ${SHEET_URL || '⚠️  NO CONFIGURADA — agrega SHEET_CSV_URL en Railway'}`);
+  console.log('');
+  await startSession();
 });
